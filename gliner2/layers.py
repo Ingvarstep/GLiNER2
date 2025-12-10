@@ -1,3 +1,5 @@
+from typing import Tuple, Optional
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -126,6 +128,75 @@ class CountLSTM(nn.Module):
         return self.projector(torch.cat([output, pc_emb.unsqueeze(0).expand_as(output)], dim=-1))
 
 
+class RotaryCountLSTM(nn.Module):
+    def __init__(self, hidden_size, max_count=20, rope_base=10_000.0):
+        """
+        Initializes the module with a learned positional embedding for count steps and a GRU,
+        enhanced with rotary position embeddings.
+        """
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.max_count = max_count
+
+        self.pos_embedding = nn.Embedding(max_count, hidden_size)
+        self.rotary_embeddings = RotaryEmbedding(hidden_size, base=rope_base)
+
+        self.gru = nn.GRU(input_size=hidden_size, hidden_size=hidden_size)
+
+        self.projector = create_mlp(
+            input_dim=hidden_size * 2,
+            intermediate_dims=[hidden_size * 4],
+            output_dim=hidden_size,
+            dropout=0.,
+            activation="relu",
+            add_layer_norm=False
+        )
+
+    def forward(self, pc_emb: torch.Tensor, gold_count_val: int) -> torch.Tensor:
+        """
+        Args:
+            pc_emb (Tensor): Field embeddings of shape (M, hidden_size).
+            gold_count_val (int): Predicted count value (number of steps).
+        Returns:
+            Tensor: Count-aware structure embeddings of shape (gold_count_val, M, hidden_size).
+        """
+        M, D = pc_emb.shape
+        device = pc_emb.device
+
+        # Get base positional embeddings (up to max_count)
+        min_count = min(gold_count_val, self.max_count)
+        base_indices = torch.arange(min_count, device=device)
+        base_pos = self.pos_embedding(base_indices)  # (min_count, hidden_size)
+
+        # If gold_count_val > max_count, tile the embeddings
+        if gold_count_val > self.max_count:
+            num_repeats = (gold_count_val + self.max_count - 1) // self.max_count
+            pos_seq = base_pos.repeat(num_repeats, 1)[:gold_count_val, :]  # (gold_count_val, D)
+        else:
+            pos_seq = base_pos  # (gold_count_val, D)
+
+        # Add batch dimension for rotary embeddings: (1, gold_count_val, D)
+        pos_seq = pos_seq.unsqueeze(0)
+
+        # Create position ids for rotary embedding
+        position_ids = torch.arange(gold_count_val, device=device).unsqueeze(0)  # (1, gold_count_val)
+
+        # Apply rotary positional embeddings
+        cos, sin = self.rotary_embeddings(pos_seq, position_ids)
+        pos_seq = apply_rotary_pos_emb(pos_seq, cos, sin)
+
+        # Reshape for GRU: (gold_count_val, M, D)
+        pos_seq = pos_seq.squeeze(0).unsqueeze(1).expand(-1, M, -1)
+
+        h0 = pc_emb.unsqueeze(0)  # shape: (1, M, hidden_size)
+
+        output, _ = self.gru(pos_seq, h0)  # (gold_count_val, M, D)
+
+        # Concatenate the GRU outputs with the original field embeddings
+        pc_broadcast = pc_emb.unsqueeze(0).expand_as(output)
+        return self.projector(torch.cat([output, pc_broadcast], dim=-1))
+    
+
 class CountLSTMv2(nn.Module):
     def __init__(self, hidden_size, max_count=20):
         super().__init__()
@@ -247,3 +318,91 @@ class CountLSTMoE(nn.Module):
         # ───── mixture weighted by gates ─────
         out = (gates.unsqueeze(-1) * x).sum(dim=2)  # [L, M, D]
         return out
+
+
+
+class RotaryEmbedding(nn.Module):
+    """
+    Standard RoPE (rotary) embedding that returns (cos, sin) tensors for a batch of position_ids.
+
+    Args:
+        dim: head_dim of each attention head (must be even).
+        max_position_embeddings: maximum seq length the cache will cover.
+        base: theta; larger values stretch frequencies (e.g., 10_000.0 like GPT-NeoX).
+        attention_scaling: optional multiplicative scaling applied to cos/sin (default 1.0).
+        device: optional device to initialize buffers on.
+
+    Forward:
+        (x_like, position_ids) -> (cos, sin) with shapes [bs, seq, dim]
+    """
+    inv_freq: torch.Tensor  # for register_buffer typing
+
+    def __init__(
+        self,
+        dim: int,
+        base: float = 10_000.0,
+        attention_scaling: float = 1.0,
+        device: Optional[torch.device] = None,
+    ):
+        super().__init__()
+        if dim % 2 != 0:
+            raise ValueError(f"RotaryEmbedding requires even head_dim; got {dim}")
+
+        self.dim = dim
+        self.base = float(base)
+        self.attention_scaling = float(attention_scaling)
+
+        # inv_freq has shape [dim/2]
+        inv_freq = 1.0 / (self.base ** (torch.arange(0, dim, 2, device=device).float() / dim))
+        self.register_buffer("inv_freq", inv_freq, persistent=False)
+        self.original_inv_freq = self.inv_freq 
+
+    @torch.no_grad()
+    def forward(self, x_like: torch.Tensor, position_ids: torch.LongTensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Args:
+            x_like: any tensor on the target device (e.g., qkv or hidden_states) to infer dtype/device
+            position_ids: LongTensor [bs, seq] with absolute positions per token
+        Returns:
+            cos, sin: [bs, seq, dim] in x_like.dtype
+        """
+        # [bs, 1, dim/2]
+        inv = self.inv_freq[None, :, None].float().expand(position_ids.shape[0], -1, 1)
+        # [bs, seq, 1]
+        pos = position_ids[:, None, :].float()
+
+        # force float32 math for stability; avoid MPS autocast weirdness
+        device_type = x_like.device.type if (isinstance(x_like.device.type, str) and x_like.device.type != "mps") else "cpu"
+        with torch.autocast(device_type=device_type, enabled=False):
+            # [bs, seq, dim/2]
+            freqs = (inv.float() @ pos.float()).transpose(1, 2) 
+            # duplicate across last dim to match head_dim
+            emb = torch.cat([freqs, freqs], dim=-1)  # [bs, seq, dim]
+
+            cos = emb.cos() * self.attention_scaling
+            sin = emb.sin() * self.attention_scaling
+
+        return cos.to(dtype=x_like.dtype, device=x_like.device), sin.to(dtype=x_like.dtype, device=x_like.device)
+
+
+def rotate_half(x: torch.Tensor) -> torch.Tensor:
+    """Rotate last-dim halves: (x1, x2) -> (-x2, x1)."""
+    x1 = x[..., : x.shape[-1] // 2]
+    x2 = x[..., x.shape[-1] // 2 :]
+    return torch.cat((-x2, x1), dim=-1)
+
+
+def apply_rotary_pos_emb(
+    q: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Apply RoPE to q, k.
+
+    Shapes:
+        q, k: [bs, seq, head_dim] 
+        cos, sin: [bs, seq, head_dim]
+    """
+    q_embed = (q * cos) + (rotate_half(q) * sin)
+    return q_embed
